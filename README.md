@@ -18,11 +18,41 @@ The control plane and database tools work locally; this is not the complete Supa
 - Per-project restricted database connections, five-second statement timeouts,
   200-row SQL result limits, and a 2 MB SQL response-size limit.
 
-The keys are provisioned credentials, not yet usable API authentication. The
-project API path is reserved; no REST gateway exists yet. Dashboard accounts
-are separate from the future per-project application users. Database tools use
-dedicated project logins, not administrative connections. The future public data
-API still needs its own key validation and role/RLS integration.
+The anon key authenticates the REST API and is intended to be public. It currently
+allows CRUD on every table because row-level security is not implemented. Do not
+store sensitive data or expose this development service publicly. The service-role
+key is secret and must never be embedded in a client application or exposed publicly.
+Dashboard accounts are
+separate from the future per-project application users. Database tools and REST
+requests use dedicated project logins, not administrative query connections.
+
+## Auto-generated REST API
+
+The custom introspection-based gateway is available at
+`/api/rest/v1/:projectId/:table`. Pass the anon or service key using `apikey`
+or `Authorization: Bearer <key>`:
+
+```sh
+curl 'http://localhost:3000/api/rest/v1/PROJECT_ID/todos?select=id,title&done=is.true&order=id.desc&limit=25' \
+    -H 'apikey: PROJECT_ANON_KEY'
+```
+
+GET returns a JSON array. POST accepts a JSON object or up to 100 objects and
+returns created rows. PATCH accepts a JSON object; PATCH and DELETE require at
+least one filter. Responses include `Content-Range`; `OPTIONS` supports browser
+CORS preflight. Supported filters: `eq`, `neq`, `gt`, `gte`, `lt`, `lte`, `like`,
+`ilike`, `is`, and `in`. Selection and ordering only accept real table columns;
+values are parameterized. Page size is 1-1000 (default 100); request bodies are
+limited to 64 KB / 100 rows. Filtered PATCH/DELETE preflight and lock matching
+rows, then reject and roll back when they match over 100 rows or exceed 1 MB.
+GET page size is checked before fetching rows; all responses are limited to 2 MB.
+
+Every key is compared by its SHA-256 hash. Each key creates a distinct project
+login on first use. The anon login can perform CRUD on project tables and use
+sequences, but cannot create tables, access the control plane, or connect to
+another project's schema. The service login can assume only its own project's
+schema-owner role. Both use short-lived restricted PostgreSQL connections for
+each request. RLS and application-user JWT claims are the next security milestone.
 
 ## Database Tools
 
@@ -54,8 +84,8 @@ before response-size checks; keep the platform local until stronger quotas exist
 
 ## Stack
 
-Next.js App Router, React, TypeScript, PostgreSQL, node-postgres, Zod, and
-Lucide. Manrope and IBM Plex Mono are bundled locally. No hosted services,
+Next.js App Router, React, TypeScript, PostgreSQL, node-postgres, Zod,
+`pgsql-parser`, and Lucide. Manrope and IBM Plex Mono are bundled locally. No hosted services,
 domain, or paid subscription is required.
 
 ## Run Locally
@@ -170,6 +200,8 @@ The full audit reports five high-severity entries through one development-only
 | GET | `/api/control/projects` | List the signed-in account's projects |
 | POST | `/api/control/projects` | Provision a project; return keys once |
 | DELETE | `/api/control/projects/:id` | Delete an owned project and its schema/role |
+| GET/POST/PATCH/DELETE | `/api/rest/v1/:projectId/:table` | Key-authenticated table REST API |
+| OPTIONS | `/api/rest/v1/:projectId/:table` | CORS preflight |
 | GET | `/api/control/projects/:id/tables` | List project tables |
 | POST | `/api/control/projects/:id/tables` | Create a table with an identity primary key |
 | POST | `/api/control/projects/:id/tables/:table/columns` | Add a typed column |
@@ -187,5 +219,6 @@ rate limits, email verification/recovery, request quotas, backups, TLS, secret
 management, and a narrower provisioning privilege boundary. Database statement
 timeouts and UI confirmation are not substitutes for those controls.
 
-Next: auto-generated REST endpoints with project API-key validation, filtering,
-sorting, column selection, and pagination. See [plan.md](plan.md) for the full roadmap.
+Next: per-project application auth and PostgreSQL RLS. The anon API key currently
+allows CRUD across project tables, so treat this as local-only. See [plan.md](plan.md)
+for the full roadmap.

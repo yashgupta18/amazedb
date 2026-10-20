@@ -14,7 +14,7 @@ one that is half-built. Complete the core MVP first, then add supporting feature
 - [x] Create, list, and delete projects.
 - [x] Give each project an isolated PostgreSQL schema and database role.
 - [x] Generate an anon key and a service-role key per project; display once and store hashes.
-- [ ] Activate each project's API URL. A path is reserved, but the REST gateway is not built yet.
+- [x] Activate each project's API URL with its project ID and API key.
 
 ### 2. Database per Project
 
@@ -26,11 +26,10 @@ one that is half-built. Complete the core MVP first, then add supporting feature
 
 ### 3. Auto-generated REST API
 
-- [ ] Instantly expose CRUD endpoints for every table, such as
+- [x] Expose CRUD endpoints for every table, such as
       `GET /rest/v1/users?age=gt.18`.
-- [ ] Support filtering, sorting, pagination, and selecting specific columns.
-- [ ] Use PostgREST under the hood, or build an introspection-based generator.
-      A custom generator is more work but can demonstrate additional engineering depth.
+- [x] Support filtering, sorting, pagination, and selecting specific columns.
+- [x] Build a custom introspection-based REST generator. PostgREST remains an alternative, not a dependency.
 
 ### 4. Authentication
 
@@ -47,8 +46,8 @@ one that is half-built. Complete the core MVP first, then add supporting feature
 
 ### 6. API Keys and Access Control
 
-- [ ] Distinguish anon keys from service-role keys.
-- [ ] Validate keys at an API gateway before requests reach the database.
+- [x] Distinguish anon keys from service-role keys with separate PostgreSQL roles.
+- [x] Validate keys at the REST gateway before requests reach the database.
 
 ## Tier 2: Strong Additions
 
@@ -99,7 +98,7 @@ These are options, not finalized stack decisions.
 | Control plane API | Node.js (NestJS/Express), Go, or FastAPI |
 | Per-project database | PostgreSQL Docker containers or separate schemas |
 | API gateway | Kong, Nginx, or a custom Go/Node.js proxy |
-| REST layer | PostgREST or a custom introspection-based generator |
+| REST layer | Custom introspection-based generator (implemented); PostgREST remains an alternative |
 | Auth service | Custom JWT authentication or GoTrue |
 | Storage | Local disk or MinIO |
 | Realtime | Node.js/Elixir WebSocket server using PostgreSQL notifications or logical replication |
@@ -111,7 +110,7 @@ These are options, not finalized stack decisions.
 | --- | --- | --- |
 | Weeks 1-2 | Control plane and provisioning | Dashboard signup/login; create, list, and delete projects; provision a PostgreSQL schema or container per project. |
 | Week 3 | Database tools | Table editor and SQL editor. |
-| Week 4 | REST API and gateway | REST API via PostgREST behind the gateway, with project API keys. |
+| Week 4 | REST API and gateway | Implemented custom REST gateway with project API keys. |
 | Week 5 | Authentication and RLS | Auth service, JWTs, password hashing, refresh tokens, and RLS integration. |
 | Week 6 | Storage | Buckets, file operations, public/private access, and signed URLs. |
 | Week 7 | Realtime | WebSocket subscriptions to table changes. |
@@ -127,6 +126,7 @@ optional and outside the initial eight-week build order.
 - Database: PostgreSQL, with project-specific schemas and NOLOGIN roles.
 - Dashboard authentication: scrypt passwords and revocable HttpOnly cookie sessions.
       This is not the per-project application auth service planned for week 5.
+- REST layer: custom introspection-based PostgreSQL gateway with anon/service keys.
 - Runtime: native Node.js plus local PostgreSQL, or Docker Compose for the current foundation.
 - Deployment: no paid host or domain for now; GitHub source, documentation, and a recorded demo.
 - Remaining service choices stay open until their milestones.
@@ -158,6 +158,23 @@ Desktop and mobile browser tests cover both project management and database
 tools. The standalone production server also passed SQL parser execution and
 row-insertion smoke checks; Docker container execution is still unverified.
 
-Next: auto-generated REST endpoints and API-key enforcement. Per-project
-application auth, RLS, storage, realtime, and the SDK remain pending. The Markdown
-roadmap is the source of truth; the earlier SQLite planning artifact is not updated.
+The REST/API-key milestone is implemented at `/api/rest/v1/:projectId/:table`.
+It supports GET/POST/PATCH/DELETE, selected columns, typed filters (`eq`, `neq`,
+`gt`, `gte`, `lt`, `lte`, `like`, `ilike`, `is`, `in`), ordering, and bounded
+pagination. API keys are checked by hash. Anon and service keys use distinct,
+restricted per-project PostgreSQL roles. Requests without a key, invalid keys,
+cross-project keys, and mutations without filters are rejected. CORS is enabled
+for browser clients.
+
+The public anon role currently has CRUD access to every table. RLS and per-project
+application auth are not implemented; never use sensitive data or expose this
+local MVP as a hosted service yet. GET results are capped at 1000 rows / 2 MB,
+request bodies at 64 KB / 100 rows, and filtered PATCH/DELETE at 100 matched rows
+or 1 MB of matched data, with rollback above either limit. PostgreSQL integration tests cover role
+permissions and rollback; browser tests exercise key-authenticated CRUD.
+
+Next: per-project application authentication and RLS. Storage, realtime, the SDK,
+rate limits, and public hosting remain pending. The anon key currently has CRUD
+access to all project tables; do not use sensitive data before RLS exists. The
+Markdown roadmap is the source of truth; the earlier SQLite planning artifact is
+not updated.

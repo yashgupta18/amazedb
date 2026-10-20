@@ -621,8 +621,14 @@ export default function Workspace() {
             API keys
           </h3>
           <p className="security-notice">
-            Shown once. Keep the service-role key secret.
+            Shown once. Anon keys currently allow CRUD on every project table.
+            Do not store sensitive data until RLS is implemented. Keep the
+            service-role key secret.
           </p>
+          <CopyValue
+            label="REST base URL"
+            value={`http://localhost:3000/api/rest/v1/${created.project.id}`}
+          />
           <CopyValue label="Anon key" value={created.keys.anon} />
           <CopyValue
             label="Service-role key"
@@ -653,8 +659,8 @@ export default function Workspace() {
           <CopyValue label="Project ID" value={selected.id} />
           <CopyValue label="Database schema" value={selected.schema_name} />
           <CopyValue
-            label="Reserved API path"
-            value={`/api/projects/${selected.id}/rest/v1`}
+            label="REST base URL"
+            value={`http://localhost:3000/api/rest/v1/${selected.id}`}
           />
           <dl className="provisioning-details">
             <div>
@@ -667,7 +673,7 @@ export default function Workspace() {
             </div>
             <div>
               <dt>REST gateway</dt>
-              <dd>Not implemented</dd>
+              <dd>Live / API key required</dd>
             </div>
             <div>
               <dt>Created</dt>

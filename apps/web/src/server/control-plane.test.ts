@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { after, test } from "node:test";
 import { Pool } from "pg";
 import { ProjectDatabase } from "./project-database";
+import { restRequest } from "./rest-api";
 import {
   ApiError,
   ControlPlane,
@@ -15,6 +16,218 @@ if (!process.env.DATABASE_URL)
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 const platform = new ControlPlane(pool);
 const accounts: string[] = [];
+
+test("project API keys expose filtered REST CRUD with separate anon and service roles", async () => {
+  const session = await platform.signUp({
+    email: `rest-${randomUUID()}@example.com`,
+    password: "rest-api-test-password",
+  });
+  accounts.push(session.account.id);
+  const first = await platform.createProject(session.account.id, {
+    name: "REST API",
+  });
+  const second = await platform.createProject(session.account.id, {
+    name: "Other REST API",
+  });
+  const database = new ProjectDatabase(pool);
+  await database.createTable(session.account.id, first.project.id, {
+    name: "items",
+    columns: [
+      { name: "title", type: "text", nullable: false },
+      { name: "score", type: "integer", nullable: false },
+      { name: "active", type: "boolean" },
+    ],
+  });
+  await assert.rejects(
+    database.withApiKey(first.project.id, second.keys.anon, async () => true),
+    (error: unknown) => error instanceof ApiError && error.status === 401,
+  );
+  await assert.rejects(
+    database.withApiKey(first.project.id, "invalid", async () => true),
+    (error: unknown) => error instanceof ApiError && error.status === 401,
+  );
+
+  const anon = first.keys.anon;
+  const service = first.keys.service;
+  async function rest(method: string, query = "", body?: unknown, key = anon) {
+    const request = new Request(
+      `http://localhost/api/rest/v1/${first.project.id}/items${query}`,
+      {
+        method,
+        headers: {
+          apikey: key,
+          ...(body === undefined ? {} : { "Content-Type": "application/json" }),
+        },
+        body: body === undefined ? undefined : JSON.stringify(body),
+      },
+    );
+    return restRequest(request, first.project.id, "items");
+  }
+  await database.withApiKey(
+    first.project.id,
+    anon,
+    async (client, schema, serviceRole) => {
+      assert.equal(serviceRole, false);
+      assert.notEqual(
+        (await client.query("SELECT current_user")).rows[0].current_user,
+        schema,
+      );
+    },
+  );
+  await assert.rejects(
+    database.withApiKey(first.project.id, anon, (client) =>
+      client.query("SELECT * FROM control_plane.accounts"),
+    ),
+    (error: unknown) => (error as { code?: string }).code === "42501",
+  );
+  await assert.rejects(
+    database.withApiKey(first.project.id, anon, (client, schema) =>
+      client.query(`CREATE TABLE "${schema}".anon_ddl (id integer)`),
+    ),
+    (error: unknown) => (error as { code?: string }).code === "42501",
+  );
+  const inserted = await rest("POST", "", [
+    { title: "low", score: 12, active: false },
+    { title: "medium", score: 18, active: true },
+    { title: "high", score: 31, active: true },
+  ]);
+  assert.equal((inserted as { rows: unknown[] }).rows.length, 3);
+  assert.deepEqual(
+    (
+      (await rest(
+        "GET",
+        "?select=title,score&score=gt.15&order=score.desc&limit=1&offset=0",
+      )) as { rows: unknown[] }
+    ).rows,
+    [{ title: "high", score: 31 }],
+  );
+  assert.deepEqual(
+    (
+      (await rest("GET", "?score=in.(12,31)&order=score.asc")) as {
+        rows: unknown[];
+      }
+    ).rows,
+    [
+      { id: "1", title: "low", score: 12, active: false },
+      { id: "3", title: "high", score: 31, active: true },
+    ],
+  );
+  assert.equal(
+    ((await rest("GET", "?active=is.true&score=gte.18")) as { rows: unknown[] })
+      .rows.length,
+    2,
+  );
+  await rest("PATCH", "?title=eq.low", { score: 14 });
+  assert.equal(
+    ((await rest("GET", "?id=eq.1")) as { rows: Record<string, unknown>[] })
+      .rows[0].score,
+    14,
+  );
+  await assert.rejects(
+    rest("PATCH", "", { score: 0 }),
+    (error: unknown) => error instanceof ApiError && error.status === 400,
+  );
+  await assert.rejects(
+    rest("DELETE"),
+    (error: unknown) => error instanceof ApiError && error.status === 400,
+  );
+  await assert.rejects(
+    rest("GET", "?unknown=eq.value"),
+    (error: unknown) => error instanceof ApiError && error.status === 400,
+  );
+  await assert.rejects(
+    rest("GET", "?select=id,missing"),
+    (error: unknown) => error instanceof ApiError && error.status === 400,
+  );
+  await assert.rejects(
+    rest("GET", "?order=score.sideways"),
+    (error: unknown) => error instanceof ApiError && error.status === 400,
+  );
+  const removed = await rest("DELETE", "?active=is.false");
+  assert.equal((removed as { rows: unknown[] }).rows.length, 1);
+  await database.executeSql(session.account.id, first.project.id, {
+    sql: "INSERT INTO items (title, score) SELECT 'bulk-' || generate_series(1, 101), 1",
+  });
+  await assert.rejects(
+    rest("PATCH", "?score=eq.1", { score: 2 }),
+    (error: unknown) => error instanceof ApiError && error.status === 413,
+  );
+  assert.equal(
+    ((await rest("GET", "?score=eq.1&select=id&limit=200")).rows as unknown[])
+      .length,
+    101,
+  );
+  await assert.rejects(
+    rest("DELETE", "?score=eq.1"),
+    (error: unknown) => error instanceof ApiError && error.status === 413,
+  );
+  assert.equal(
+    ((await rest("GET", "?score=eq.1&select=id&limit=200")).rows as unknown[])
+      .length,
+    101,
+  );
+  await database.executeSql(session.account.id, first.project.id, {
+    sql: "INSERT INTO items (title, score) VALUES (repeat('x', 2100000), 3)",
+  });
+  await assert.rejects(
+    rest("GET", "?score=eq.3&select=title"),
+    (error: unknown) => error instanceof ApiError && error.status === 413,
+  );
+
+  await database.withApiKey(
+    first.project.id,
+    service,
+    async (client, schema, serviceRole) => {
+      assert.equal(serviceRole, true);
+      assert.equal(
+        (await client.query("SELECT current_user")).rows[0].current_user,
+        schema,
+      );
+      await client.query(`CREATE TABLE "${schema}".service_only (id integer)`);
+    },
+  );
+  await database.withApiKey(first.project.id, anon, async (client, schema) => {
+    assert.equal(
+      (await client.query(`SELECT * FROM "${schema}".service_only`)).rowCount,
+      0,
+    );
+  });
+  assert.equal(
+    (
+      await pool.query("SELECT 1 FROM pg_roles WHERE rolname = $1", [
+        `a_${first.project.schema_name.slice(2)}`,
+      ])
+    ).rowCount,
+    1,
+  );
+  assert.equal(
+    (
+      await pool.query("SELECT 1 FROM pg_roles WHERE rolname = $1", [
+        `s_${first.project.schema_name.slice(2)}`,
+      ])
+    ).rowCount,
+    1,
+  );
+  assert.equal(
+    (
+      await pool.query("SELECT 1 FROM pg_roles WHERE rolname = $1", [
+        `n_${first.project.schema_name.slice(2)}`,
+      ])
+    ).rowCount,
+    1,
+  );
+  await platform.deleteProject(session.account.id, first.project.id);
+  for (const prefix of ["a", "s", "n", "d", "p"]) {
+    assert.equal(
+      (
+        await pool.query("SELECT 1 FROM pg_roles WHERE rolname = $1", [
+          `${prefix}_${first.project.schema_name.slice(2)}`,
+        ])
+      ).rowCount,
+      0,
+    );
+  }
+});
 
 test("database tools create tables and columns, mutate keyed rows, and bound SQL results", async () => {
   const session = await platform.signUp({
@@ -61,6 +274,10 @@ test("database tools create tables and columns, mutate keyed rows, and bound SQL
   });
   const page = await database.readRows(session.account.id, project.id, "todos");
   assert.equal(page.rows[0].title, "Updated");
+  assert.equal(
+    page.columns.find((column) => column.name === "done")?.generated,
+    false,
+  );
   assert.equal(
     page.columns.find((column) => column.name === "id")?.generated,
     true,

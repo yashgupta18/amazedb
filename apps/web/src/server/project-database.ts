@@ -1,5 +1,5 @@
-import { createHmac } from "node:crypto";
-import { Client, type Pool } from "pg";
+import { createHash, createHmac } from "node:crypto";
+import { Client, type Pool, type PoolClient } from "pg";
 import Cursor from "pg-cursor";
 import { parse } from "pgsql-parser";
 import { z } from "zod";
@@ -11,7 +11,11 @@ import {
   type SqlResult,
 } from "../lib/database-types";
 
-type ProjectAccess = { schema_name: string; service_key_hash: string };
+type ProjectAccess = {
+  schema_name: string;
+  anon_key_hash: string;
+  service_key_hash: string;
+};
 
 const newName = z
   .string()
@@ -27,12 +31,16 @@ const columnInput = z.object({
 const valuesInput = z.record(z.string(), z.unknown());
 const rowInput = z.object({ values: valuesInput, key: valuesInput.optional() });
 
-function quoteName(value: string) {
+export function quoteName(value: string) {
   z.string().min(1).max(63).parse(value);
   return `"${value.replaceAll('"', '""')}"`;
 }
 
-async function columnsFor(client: Client, schema: string, table: string) {
+export async function columnsFor(
+  client: Client,
+  schema: string,
+  table: string,
+) {
   const result = await client.query<Column>(
     `SELECT attribute.attname AS name, pg_catalog.format_type(attribute.atttypid, attribute.atttypmod) AS type,
       NOT attribute.attnotnull AS nullable,
@@ -119,13 +127,159 @@ function rejectConfigurationCalls(node: unknown): void {
 }
 
 function roleIdentifier(value: string) {
-  if (!/^[pd]_[a-f0-9]{32}$/.test(value))
+  if (!/^[pdnas]_[a-f0-9]{32}$/.test(value))
     throw new Error("Invalid project role.");
   return `"${value}"`;
 }
 
+async function createRole(client: PoolClient, name: string, password?: string) {
+  const login = password === undefined ? "NOLOGIN" : "LOGIN";
+  const statement = await client.query<{ sql: string }>(
+    "SELECT format('CREATE ROLE %I %s NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS%s', $1::text, $2::text, CASE WHEN $3::text IS NULL THEN '' ELSE format(' PASSWORD %L', $3::text) END) AS sql",
+    [name, login, password ?? null],
+  );
+  await client.query(statement.rows[0].sql);
+}
+
 export class ProjectDatabase {
-  constructor(private pool: Pool) {}
+  constructor(private readonly pool: Pool) {}
+
+  async withApiKey<Result>(
+    projectId: string,
+    apiKey: string | undefined,
+    work: (
+      client: Client,
+      schema: string,
+      serviceRole: boolean,
+    ) => Promise<Result>,
+  ) {
+    if (
+      !apiKey ||
+      apiKey.length > 160 ||
+      !/^amz_(anon|service)_[A-Za-z0-9_-]{40,60}$/.test(apiKey)
+    )
+      throw new ApiError(401, "A valid project API key is required.");
+    z.uuid().parse(projectId);
+    const keyHash = createHash("sha256").update(apiKey).digest("hex");
+    const admin = await this.pool.connect();
+    let access: {
+      schema: string;
+      login: string;
+      password: string;
+      role: string;
+      serviceRole: boolean;
+    };
+    try {
+      await admin.query("BEGIN");
+      await admin.query(
+        "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+        [projectId],
+      );
+      const result = await admin.query<
+        ProjectAccess & { role: "anon" | "service" }
+      >(
+        `SELECT schema_name, anon_key_hash, service_key_hash,
+          CASE WHEN anon_key_hash = $2 THEN 'anon' ELSE 'service' END AS role
+         FROM control_plane.projects
+         WHERE id = $1 AND (anon_key_hash = $2 OR service_key_hash = $2)
+         FOR SHARE`,
+        [projectId, keyHash],
+      );
+      const project = result.rows[0];
+      if (!project)
+        throw new ApiError(401, "A valid project API key is required.");
+
+      const suffix = project.schema_name.slice(2);
+      const anonRole = `n_${suffix}`;
+      const serviceRole = project.role === "service";
+      const login = `${serviceRole ? "s" : "a"}_${suffix}`;
+      const role = serviceRole ? project.schema_name : anonRole;
+      const credentialHash = serviceRole
+        ? project.service_key_hash
+        : project.anon_key_hash;
+      const password = createHmac("sha256", credentialHash)
+        .update(`api-login:${project.role}:${projectId}`)
+        .digest("hex");
+      const roleExists = async (name: string) =>
+        (await admin.query("SELECT 1 FROM pg_roles WHERE rolname = $1", [name]))
+          .rowCount !== 0;
+
+      if (!serviceRole && !(await roleExists(anonRole))) {
+        await createRole(admin, anonRole);
+        await admin.query(
+          `GRANT USAGE ON SCHEMA ${roleIdentifier(project.schema_name)} TO ${roleIdentifier(anonRole)}`,
+        );
+        await admin.query(
+          `GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA ${roleIdentifier(project.schema_name)} TO ${roleIdentifier(anonRole)}`,
+        );
+        await admin.query(
+          `GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA ${roleIdentifier(project.schema_name)} TO ${roleIdentifier(anonRole)}`,
+        );
+        const defaults = await admin.query<{ sql: string }>(
+          "SELECT format('ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA %I GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO %I', $1::text, $2::text, $3::text) AS sql",
+          [project.schema_name, project.schema_name, anonRole],
+        );
+        await admin.query(defaults.rows[0].sql);
+        const sequenceDefaults = await admin.query<{ sql: string }>(
+          "SELECT format('ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA %I GRANT USAGE, SELECT ON SEQUENCES TO %I', $1::text, $2::text, $3::text) AS sql",
+          [project.schema_name, project.schema_name, anonRole],
+        );
+        await admin.query(sequenceDefaults.rows[0].sql);
+      }
+      if (!(await roleExists(login))) {
+        await createRole(admin, login, password);
+        await admin.query(
+          `GRANT ${roleIdentifier(role)} TO ${roleIdentifier(login)}`,
+        );
+      }
+      await admin.query(
+        `GRANT ${roleIdentifier(role)} TO ${roleIdentifier(login)}`,
+      );
+      await admin.query("COMMIT");
+      access = {
+        schema: project.schema_name,
+        login,
+        password,
+        role,
+        serviceRole,
+      };
+    } catch (error) {
+      await admin.query("ROLLBACK");
+      throw error;
+    } finally {
+      admin.release();
+    }
+
+    const connection = new URL(this.pool.options.connectionString ?? "");
+    connection.username = access.login;
+    connection.password = access.password;
+    const client = new Client({
+      connectionString: connection.toString(),
+      connectionTimeoutMillis: 5_000,
+      statement_timeout: 5_000,
+      lock_timeout: 1_000,
+      query_timeout: 6_000,
+      application_name: access.serviceRole
+        ? "amazedb-rest-service"
+        : "amazedb-rest-anon",
+    });
+    try {
+      await client.connect();
+      await client.query("BEGIN");
+      await client.query(`SET LOCAL ROLE ${roleIdentifier(access.role)}`);
+      await client.query(
+        `SET LOCAL search_path TO ${roleIdentifier(access.schema)}, pg_catalog`,
+      );
+      const result = await work(client, access.schema, access.serviceRole);
+      await client.query("COMMIT");
+      return result;
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    } finally {
+      await client.end();
+    }
+  }
 
   async listTables(ownerId: string, projectId: string) {
     return this.withProject(
@@ -226,8 +380,12 @@ export class ProjectDatabase {
         false,
       );
       const target = `${quoteName(schema)}.${quoteName(table)}`;
+      const names = entries.map((entry) => entry.name).join(", ");
+      const placeholders = entries
+        .map((_, index) => `$${index + 1}`)
+        .join(", ");
       const sql = entries.length
-        ? `INSERT INTO ${target} (${entries.map((entry) => entry.name).join(", ")}) VALUES (${entries.map((_, index) => `$${index + 1}`).join(", ")}) RETURNING *`
+        ? `INSERT INTO ${target} (${names}) VALUES (${placeholders}) RETURNING *`
         : `INSERT INTO ${target} DEFAULT VALUES RETURNING *`;
       return (
         await client.query(
@@ -251,8 +409,11 @@ export class ProjectDatabase {
       if (!entries.length)
         throw new ApiError(400, "Provide at least one changed column.");
       const where = keyPredicate(columns, key, entries.length);
+      const assignments = entries
+        .map((entry, index) => `${entry.name} = $${index + 1}`)
+        .join(", ");
       const result = await client.query(
-        `UPDATE ${quoteName(schema)}.${quoteName(table)} SET ${entries.map((entry, index) => `${entry.name} = $${index + 1}`).join(", ")} WHERE ${where.sql} RETURNING *`,
+        `UPDATE ${quoteName(schema)}.${quoteName(table)} SET ${assignments} WHERE ${where.sql} RETURNING *`,
         [...entries.map((entry) => entry.value), ...where.values],
       );
       if (!result.rows[0])

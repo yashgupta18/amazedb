@@ -26,7 +26,22 @@ test("database tools support table and row editing and isolated SQL", async ({
       data: { name },
     });
     expect(created.status()).toBe(201);
-    const { project } = await created.json();
+    const { project, keys } = await created.json();
+    const restUrl = `/api/rest/v1/${project.id}`;
+    const preflight = await page.request.fetch(`${restUrl}/todos`, {
+      method: "OPTIONS",
+      headers: { Origin: "https://demo.example" },
+    });
+    expect(preflight.status()).toBe(204);
+    expect(preflight.headers()["access-control-allow-origin"]).toBe("*");
+    expect((await page.request.get(`${restUrl}/todos`)).status()).toBe(401);
+    expect(
+      (
+        await page.request.get(`${restUrl}/todos`, {
+          headers: { apikey: "invalid" },
+        })
+      ).status(),
+    ).toBe(401);
     const oversized = await page.request.post(
       `/api/control/projects/${project.id}/sql`,
       { headers: { Origin: origin }, data: { sql: "x".repeat(70_000) } },
@@ -76,6 +91,44 @@ test("database tools support table and row editing and isolated SQL", async ({
     await expect(
       page.getByRole("columnheader").filter({ hasText: "done" }),
     ).toBeVisible();
+    const apiInsert = await page.request.post(`${restUrl}/todos`, {
+      headers: { apikey: keys.anon },
+      data: { title: "REST row", done: true },
+    });
+    const apiInsertBody = await apiInsert.text();
+    expect(apiInsert.status(), apiInsertBody).toBe(201);
+    expect(apiInsert.headers()["access-control-allow-origin"]).toBe("*");
+    const apiRead = await page.request.get(
+      `${restUrl}/todos?select=title,done&title=eq.REST%20row&done=is.true&order=title.desc&limit=1&offset=0`,
+      { headers: { Authorization: `Bearer ${keys.anon}` } },
+    );
+    expect(apiRead.status()).toBe(200);
+    expect(await apiRead.json()).toEqual([{ title: "REST row", done: true }]);
+    expect(apiRead.headers()["content-range"]).toBe("0-0/*");
+    expect(
+      (
+        await page.request.get(`${restUrl}/todos?select=id`, {
+          headers: { apikey: keys.service },
+        })
+      ).status(),
+    ).toBe(200);
+    const noFilter = await page.request.patch(`${restUrl}/todos`, {
+      headers: { apikey: keys.anon },
+      data: { title: "Unsafe update" },
+    });
+    expect(noFilter.status()).toBe(400);
+    const apiUpdate = await page.request.patch(
+      `${restUrl}/todos?title=eq.REST%20row`,
+      { headers: { apikey: keys.anon }, data: { title: "REST updated" } },
+    );
+    expect(await apiUpdate.json()).toEqual([
+      { id: "2", title: "REST updated", done: true },
+    ]);
+    const apiDelete = await page.request.delete(
+      `${restUrl}/todos?title=eq.REST%20updated`,
+      { headers: { apikey: keys.anon } },
+    );
+    expect((await apiDelete.json()).length).toBe(1);
     await page.getByRole("button", { name: "Edit row 1", exact: true }).click();
     await page.getByLabel("done mode", { exact: true }).selectOption("value");
     await page.locator('[id="value-done"]').selectOption("true");

@@ -78,7 +78,7 @@ const projectColumns = `id, name, schema_name, created_at,
   (SELECT count(*)::int FROM pg_tables WHERE schemaname = schema_name) AS table_count`;
 
 export class ControlPlane {
-  constructor(private pool: Pool) {}
+  constructor(private readonly pool: Pool) {}
 
   private async transaction<Result>(
     work: (client: PoolClient) => Promise<Result>,
@@ -215,9 +215,50 @@ export class ControlPlane {
       );
       if (!result.rows[0]) throw new ApiError(404, "Project not found.");
       const schemaName = identifier(result.rows[0].schema_name);
+      const suffix = result.rows[0].schema_name.slice(2);
+      const editorLogin = `d_${suffix}`;
+      const anonRole = `n_${suffix}`;
+      const anonLogin = `a_${suffix}`;
+      const serviceLogin = `s_${suffix}`;
+      const existing = new Set(
+        (
+          await client.query<{ rolname: string }>(
+            "SELECT rolname FROM pg_roles WHERE rolname = ANY($1::text[])",
+            [[editorLogin, anonRole, anonLogin, serviceLogin]],
+          )
+        ).rows.map((role) => role.rolname),
+      );
+      const roleName = (name: string) => `"${name}"`;
+      const runForRoles = (
+        roles: string[],
+        command: (role: string) => string,
+      ) =>
+        roles
+          .filter((role) => existing.has(role))
+          .reduce<Promise<void>>(
+            (pending, role) =>
+              pending.then(async () => {
+                await client.query(command(role));
+              }),
+            Promise.resolve(),
+          );
+      if (existing.has(anonLogin))
+        await client.query(
+          `REVOKE ${roleName(anonRole)} FROM ${roleName(anonLogin)}`,
+        );
+      await runForRoles(
+        [editorLogin, serviceLogin],
+        (login) => `REVOKE ${schemaName} FROM ${roleName(login)}`,
+      );
+      await runForRoles(
+        [editorLogin, anonLogin, serviceLogin, anonRole],
+        (role) => `DROP OWNED BY ${roleName(role)}`,
+      );
       await client.query(`DROP SCHEMA ${schemaName} CASCADE`);
-      const loginRole = result.rows[0].schema_name.replace(/^p_/, "d_");
-      await client.query(`DROP ROLE IF EXISTS "${loginRole}"`);
+      await runForRoles(
+        [editorLogin, anonLogin, serviceLogin, anonRole],
+        (role) => `DROP ROLE ${roleName(role)}`,
+      );
       await client.query(`DROP ROLE ${schemaName}`);
     });
   }
