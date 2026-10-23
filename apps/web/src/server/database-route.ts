@@ -42,6 +42,21 @@ export async function databaseRequest(
         projectId,
         await readJson(request),
       );
+    if (resource === "policies" && segments.length === 4) {
+      if (method === "GET")
+        return {
+          policies: await database.listPolicies(ownerId, projectId, table),
+        };
+      if (method === "POST")
+        return await database.createOwnerPolicy(
+          ownerId,
+          projectId,
+          table,
+          await readJson(request),
+        );
+    }
+    if (resource === "policies" && segments.length === 5 && method === "DELETE")
+      return await database.deletePolicy(ownerId, projectId, table, action);
     if (resource !== "tables") throw new ApiError(404, "Endpoint not found.");
     if (segments.length === 3) {
       if (method === "GET")

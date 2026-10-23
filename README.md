@@ -18,13 +18,13 @@ The control plane and database tools work locally; this is not the complete Supa
 - Per-project restricted database connections, five-second statement timeouts,
   200-row SQL result limits, and a 2 MB SQL response-size limit.
 
-The anon key authenticates the REST API and is intended to be public. It currently
-allows CRUD on every table because row-level security is not implemented. Do not
-store sensitive data or expose this development service publicly. The service-role
-key is secret and must never be embedded in a client application or exposed publicly.
-Dashboard accounts are
-separate from the future per-project application users. Database tools and REST
-requests use dedicated project logins, not administrative query connections.
+The anon key authenticates the REST API and has CRUD grants on project tables.
+Tables with RLS and an owner policy restrict access to matching users; tables
+without policies remain broadly accessible. Do not store sensitive data or expose
+this development service publicly. The service-role key is secret and must never
+be embedded in a client application or exposed publicly. Dashboard accounts are
+separate from per-project application users. Database tools and REST requests use
+dedicated project logins, not administrative query connections.
 
 ## Auto-generated REST API
 
@@ -52,7 +52,58 @@ login on first use. The anon login can perform CRUD on project tables and use
 sequences, but cannot create tables, access the control plane, or connect to
 another project's schema. The service login can assume only its own project's
 schema-owner role. Both use short-lived restricted PostgreSQL connections for
-each request. RLS and application-user JWT claims are the next security milestone.
+each request.
+
+## Project Authentication and RLS
+
+Project auth is separate from dashboard login. Use the anon key with
+`/api/auth/v1/:projectId/signup`, `/login`, `/refresh`, and `/logout`. Signup and
+login take `{ "email": "...", "password": "..." }`; passwords require 10-128
+characters and are scrypt-hashed. Successful responses include a 15-minute
+HS256 access JWT and a 30-day opaque refresh token. Refresh tokens are stored as
+SHA-256 hashes, revoked on rotation/logout, and accepted once. Include the access
+token as `Authorization: Bearer <access_token>` alongside `apikey: <anon_key>` on
+REST calls. JWTs are bound to the project audience; verified subject and role
+claims are set transaction-locally in PostgreSQL. Do not combine a user token
+with the service-role key.
+
+In a project's **RLS policies** tab, select a UUID owner column, a policy name,
+and a command. Creating the policy enables RLS and adds an owner predicate using
+the verified JWT subject. INSERT checks the new row; SELECT, UPDATE, and DELETE
+filter by owner. The SQL editor can create policies for advanced use. Service-role
+requests bypass RLS as the project schema owner. Anon requests have no user subject
+and see no rows on a protected table. A table with RLS enabled and no matching
+policy denies anon/authenticated access. RLS is per table: tables without policies
+remain accessible to anon-key CRUD. Email verification, password recovery, and
+public-service hardening are not implemented.
+
+## TypeScript Client
+
+Import `createClient` from `src/lib/client.ts`. The client keeps access and refresh
+tokens in memory only; reloading the page signs the client out. Call
+`auth.refreshSession()` explicitly when needed.
+
+```ts
+import { createClient } from "./src/lib/client";
+
+const client = createClient(
+    "http://localhost:3000/api/rest/v1/PROJECT_ID",
+    "PROJECT_ANON_KEY",
+);
+await client.auth.signIn({ email: "alice@example.com", password: "..." });
+const todos = await client
+    .from("todos")
+    .select("id,title")
+    .eq("done", false)
+    .order("id", { ascending: false })
+    .limit(25)
+    .execute();
+```
+
+The client also provides `auth.signUp`, `auth.signOut`, `auth.refreshSession`,
+`auth.getSession`, and table `insert`, `update`, `delete`, filter, and range
+methods. It sends the anon key for project access and adds the in-memory bearer
+JWT after sign-in.
 
 ## Database Tools
 
@@ -64,7 +115,7 @@ use typed controls. Editing saves only changed fields. SQL-created tables withou
 primary keys are viewable and insertable, but row edits/deletes are disabled.
 
 Use the **SQL editor** tab for one statement at a time. SELECT, INSERT, UPDATE,
-DELETE, CREATE/ALTER TABLE, CREATE INDEX, and DROP TABLE/INDEX are supported.
+DELETE, CREATE/ALTER TABLE, CREATE INDEX/POLICY, and DROP TABLE/INDEX/POLICY are supported.
 Transactions, role/configuration changes, functions, procedural blocks, and
 other statement types are deliberately excluded. Changes execute immediately
 inside a server-managed transaction and commit only on success. SQL errors or
@@ -171,15 +222,17 @@ npx playwright install chromium
 npm run test:e2e
 ```
 
-The PostgreSQL integration tests cover password/key hashing, duplicate signup,
-failed login, session expiration/revocation, owner scoping, schema isolation,
+The PostgreSQL integration tests cover dashboard and project-user password/key
+hashing, duplicate signup, failed login, refresh rotation/replay/revocation, JWT
+expiry/audience validation, two-user RLS isolation, owner scoping, schema isolation,
 public-schema restrictions, editor-login role-reset attacks, and schema/role
 deletion. They also cover table/column creation, keyed row CRUD, SQL parsing,
 timeouts, result limits, pagination, injection attempts, and complete writes
-with truncated RETURNING results. Browser tests cover the account/project
-lifecycle and database-tool workflows on desktop and mobile. They check copying,
-search, reload persistence, origin checks, invalid/oversized JSON, typed editing,
-SQL errors, no-primary-key tables, and pagination. Tests create their own accounts and
+with truncated RETURNING results. SDK tests cover fluent queries and in-memory
+auth. Browser tests cover the account/project lifecycle, database tools, app auth,
+and RLS on desktop and mobile. They check copying, search, reload persistence,
+origin checks, invalid/oversized JSON, typed editing, SQL errors, no-primary-key
+tables, and pagination. Tests create their own accounts and
 clean up their own data. Browser tests start a development server if needed and
 write screenshots under the ignored `apps/web/test-results` directory.
 
@@ -197,6 +250,11 @@ The full audit reports five high-severity entries through one development-only
 | POST | `/api/control/auth/login` | Start a dashboard session |
 | GET | `/api/control/auth/session` | Read the current dashboard account |
 | POST | `/api/control/auth/logout` | Revoke the current session |
+| POST | `/api/auth/v1/:projectId/signup` | Create a project user and issue access/refresh tokens |
+| POST | `/api/auth/v1/:projectId/login` | Authenticate a project user |
+| POST | `/api/auth/v1/:projectId/refresh` | Rotate a project refresh token |
+| POST | `/api/auth/v1/:projectId/logout` | Revoke a project refresh token |
+| TypeScript | `createClient(url, anonKey)` | In-memory auth and fluent REST client |
 | GET | `/api/control/projects` | List the signed-in account's projects |
 | POST | `/api/control/projects` | Provision a project; return keys once |
 | DELETE | `/api/control/projects/:id` | Delete an owned project and its schema/role |
@@ -205,6 +263,9 @@ The full audit reports five high-severity entries through one development-only
 | GET | `/api/control/projects/:id/tables` | List project tables |
 | POST | `/api/control/projects/:id/tables` | Create a table with an identity primary key |
 | POST | `/api/control/projects/:id/tables/:table/columns` | Add a typed column |
+| GET | `/api/control/projects/:id/policies/:table` | List row-level security policies |
+| POST | `/api/control/projects/:id/policies/:table` | Enable RLS and create a UUID owner policy |
+| DELETE | `/api/control/projects/:id/policies/:table/:policy` | Delete a policy (RLS remains enabled) |
 | GET | `/api/control/projects/:id/tables/:table/rows?page=0` | Read a 50-row page |
 | POST | `/api/control/projects/:id/tables/:table/rows` | Insert `{ "values": { ... } }` |
 | PATCH | `/api/control/projects/:id/tables/:table/rows` | Update `{ "key": { ... }, "values": { ... } }` |
@@ -219,6 +280,5 @@ rate limits, email verification/recovery, request quotas, backups, TLS, secret
 management, and a narrower provisioning privilege boundary. Database statement
 timeouts and UI confirmation are not substitutes for those controls.
 
-Next: per-project application auth and PostgreSQL RLS. The anon API key currently
-allows CRUD across project tables, so treat this as local-only. See [plan.md](plan.md)
-for the full roadmap.
+Next: local file storage. Tables without RLS policies still allow anon-key CRUD,
+so keep this local and avoid sensitive data. See [plan.md](plan.md) for the full roadmap.

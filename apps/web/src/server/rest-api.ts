@@ -205,10 +205,18 @@ async function bodyJson(request: Request) {
 function apiKey(request: Request) {
   const explicit = request.headers.get("apikey");
   const authorization = request.headers.get("authorization");
-  const bearer = /^Bearer ([A-Za-z0-9_-]+)$/.exec(authorization ?? "")?.[1];
-  if (explicit && bearer && explicit !== bearer)
-    throw new ApiError(401, "API key and bearer token do not match.");
-  return explicit ?? bearer;
+  const bearer = /^Bearer ([A-Za-z0-9_.-]+)$/.exec(authorization ?? "")?.[1];
+  if (explicit) return explicit;
+  return bearer;
+}
+
+function projectAccessToken(request: Request) {
+  if (!request.headers.get("apikey")) return undefined;
+  const authorization = request.headers.get("authorization");
+  if (!authorization) return undefined;
+  const bearer = /^Bearer ([A-Za-z0-9_.-]+)$/.exec(authorization)?.[1];
+  if (!bearer) throw new ApiError(401, "Use a Bearer access token.");
+  return bearer === request.headers.get("apikey") ? undefined : bearer;
 }
 
 function writeEntries(columns: Column[], body: unknown) {
@@ -287,6 +295,7 @@ async function withAuthorizedTable<Result>(
       const columns = await columnsFor(client, schema, table);
       return work(client, schema, serviceRole, columns);
     },
+    projectAccessToken(request),
   );
 }
 

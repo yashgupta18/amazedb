@@ -33,16 +33,16 @@ one that is half-built. Complete the core MVP first, then add supporting feature
 
 ### 4. Authentication
 
-- [ ] Support email and password signup and login for project applications.
-- [ ] Issue and verify JWTs.
-- [ ] Implement password hashing and refresh tokens.
-- [ ] Maintain a `users` table per project.
+- [x] Support email and password signup and login for project applications.
+- [x] Issue and verify short-lived JWTs with project audience and user claims.
+- [x] Implement password hashing and rotating refresh tokens.
+- [x] Maintain project-scoped application users and sessions.
 - [ ] Expose client SDK methods such as `signUp()`, `signIn()`, and `signOut()`.
 
 ### 5. Row Level Security (RLS)
 
-- [ ] Let users write policies such as "users can only read their own rows."
-- [ ] Pass JWT claims into PostgreSQL so policies work.
+- [x] Let project owners create owner-column UUID policies from the dashboard.
+- [x] Pass verified JWT claims into PostgreSQL transaction-locally so policies work.
 
 ### 6. API Keys and Access Control
 
@@ -65,10 +65,10 @@ one that is half-built. Complete the core MVP first, then add supporting feature
 
 ### 9. Client SDK
 
-- [ ] Build a small JavaScript/TypeScript library.
-- [ ] Support initialization with `createClient(url, key)`.
-- [ ] Support fluent queries such as `.from('todos').select()`.
-- [ ] Include the authentication methods from the core MVP.
+- [x] Build a small JavaScript/TypeScript library.
+- [x] Support initialization with `createClient(url, key)`.
+- [x] Support fluent queries such as `.from('todos').select()`.
+- [x] Include project `signUp()`, `signIn()`, `signOut()`, and refresh methods.
 
 ### 10. Dashboard Polish
 
@@ -111,10 +111,10 @@ These are options, not finalized stack decisions.
 | Weeks 1-2 | Control plane and provisioning | Dashboard signup/login; create, list, and delete projects; provision a PostgreSQL schema or container per project. |
 | Week 3 | Database tools | Table editor and SQL editor. |
 | Week 4 | REST API and gateway | Implemented custom REST gateway with project API keys. |
-| Week 5 | Authentication and RLS | Auth service, JWTs, password hashing, refresh tokens, and RLS integration. |
+| Week 5 | Authentication and RLS | Implemented project auth, JWTs, password hashing, refresh rotation, and owner-column RLS policies. |
 | Week 6 | Storage | Buckets, file operations, public/private access, and signed URLs. |
 | Week 7 | Realtime | WebSocket subscriptions to table changes. |
-| Week 8 | SDK, docs, and demo | Client SDK, documentation, and a todo or chat application built on the platform. |
+| Week 8 | SDK, docs, and demo | SDK implemented; project documentation and a todo or chat application demo remain. |
 
 Dashboard polish has no dedicated week in the initial schedule. Tier 3 remains
 optional and outside the initial eight-week build order.
@@ -127,6 +127,9 @@ optional and outside the initial eight-week build order.
 - Dashboard authentication: scrypt passwords and revocable HttpOnly cookie sessions.
       This is not the per-project application auth service planned for week 5.
 - REST layer: custom introspection-based PostgreSQL gateway with anon/service keys.
+- TypeScript SDK: `createClient(url, key)`, fluent REST queries, and in-memory project auth.
+- Project authentication: scrypt passwords, 15-minute HS256 JWTs, and rotating 30-day hashed refresh tokens.
+- RLS: dashboard-created UUID owner-column policies; claims are verified and set transaction-locally.
 - Runtime: native Node.js plus local PostgreSQL, or Docker Compose for the current foundation.
 - Deployment: no paid host or domain for now; GitHub source, documentation, and a recorded demo.
 - Remaining service choices stay open until their milestones.
@@ -166,15 +169,29 @@ restricted per-project PostgreSQL roles. Requests without a key, invalid keys,
 cross-project keys, and mutations without filters are rejected. CORS is enabled
 for browser clients.
 
-The public anon role currently has CRUD access to every table. RLS and per-project
-application auth are not implemented; never use sensitive data or expose this
-local MVP as a hosted service yet. GET results are capped at 1000 rows / 2 MB,
+The public anon role has CRUD grants on every table, but forced RLS policies now
+restrict tables where project owners define policies. Tables without a policy,
+and all other missing production controls, still make this a local-only MVP.
+GET results are capped at 1000 rows / 2 MB,
 request bodies at 64 KB / 100 rows, and filtered PATCH/DELETE at 100 matched rows
 or 1 MB of matched data, with rollback above either limit. PostgreSQL integration tests cover role
 permissions and rollback; browser tests exercise key-authenticated CRUD.
 
-Next: per-project application authentication and RLS. Storage, realtime, the SDK,
-rate limits, and public hosting remain pending. The anon key currently has CRUD
-access to all project tables; do not use sensitive data before RLS exists. The
-Markdown roadmap is the source of truth; the earlier SQLite planning artifact is
-not updated.
+The auth/RLS milestone is implemented: project-scoped email/password users,
+scrypt password hashes, 15-minute project-audience JWTs, 30-day hashed refresh
+tokens rotated on use, and logout revocation. The dashboard can create an owner
+UUID policy for SELECT/INSERT/UPDATE/DELETE/ALL; policies use the verified JWT
+subject and enable RLS on the table. Anon requests without a token are filtered
+out by the policy; the service-role connection bypasses RLS as PostgreSQL table
+owner. PostgreSQL and browser tests cover user isolation and refresh replay.
+
+The TypeScript SDK is implemented in `apps/web/src/lib/client.ts`. It offers
+`createClient`, fluent filters/order/range/CRUD, signup/login/refresh/logout, and
+in-memory token handling. Unit tests cover URL/query/header construction and
+refresh/logout behavior.
+
+Next: local file storage. Email verification/recovery, rate limits, realtime,
+demo app, and public hosting remain pending. Tables without an RLS policy still
+expose CRUD to anon keys, so do not use sensitive data or host this MVP publicly.
+The Markdown roadmap is the source of truth; the earlier SQLite planning artifact
+is not updated.

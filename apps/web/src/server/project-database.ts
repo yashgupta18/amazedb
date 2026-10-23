@@ -4,6 +4,7 @@ import Cursor from "pg-cursor";
 import { parse } from "pgsql-parser";
 import { z } from "zod";
 import { ApiError } from "./control-plane";
+import { verifyProjectAccessToken, type ProjectClaims } from "./project-tokens";
 import {
   columnTypes,
   type Column,
@@ -30,6 +31,21 @@ const columnInput = z.object({
 });
 const valuesInput = z.record(z.string(), z.unknown());
 const rowInput = z.object({ values: valuesInput, key: valuesInput.optional() });
+const policyName = z.string().regex(/^[a-z_][a-z0-9_]{0,62}$/);
+const policyInput = z.object({
+  name: policyName,
+  ownerColumn: z.string().regex(/^[a-z_][a-z0-9_]{0,62}$/),
+  command: z.enum(["select", "insert", "update", "delete", "all"]),
+});
+
+export type RlsPolicy = {
+  policyname: string;
+  permissive: string;
+  roles: string[];
+  cmd: string;
+  qual: string | null;
+  with_check: string | null;
+};
 
 export function quoteName(value: string) {
   z.string().min(1).max(63).parse(value);
@@ -152,6 +168,7 @@ export class ProjectDatabase {
       schema: string,
       serviceRole: boolean,
     ) => Promise<Result>,
+    accessToken?: string,
   ) {
     if (
       !apiKey ||
@@ -168,6 +185,7 @@ export class ProjectDatabase {
       password: string;
       role: string;
       serviceRole: boolean;
+      claims: ProjectClaims | null;
     };
     try {
       await admin.query("BEGIN");
@@ -192,6 +210,18 @@ export class ProjectDatabase {
       const suffix = project.schema_name.slice(2);
       const anonRole = `n_${suffix}`;
       const serviceRole = project.role === "service";
+      if (serviceRole && accessToken)
+        throw new ApiError(
+          401,
+          "Do not send a user token with a service-role key.",
+        );
+      const claims = accessToken
+        ? await verifyProjectAccessToken(
+            projectId,
+            project.service_key_hash,
+            accessToken,
+          )
+        : null;
       const login = `${serviceRole ? "s" : "a"}_${suffix}`;
       const role = serviceRole ? project.schema_name : anonRole;
       const credentialHash = serviceRole
@@ -242,6 +272,7 @@ export class ProjectDatabase {
         password,
         role,
         serviceRole,
+        claims,
       };
     } catch (error) {
       await admin.query("ROLLBACK");
@@ -269,6 +300,17 @@ export class ProjectDatabase {
       await client.query(`SET LOCAL ROLE ${roleIdentifier(access.role)}`);
       await client.query(
         `SET LOCAL search_path TO ${roleIdentifier(access.schema)}, pg_catalog`,
+      );
+      const claims = access.serviceRole
+        ? { sub: "", role: "service_role", aud: projectId, iss: "amazedb" }
+        : access.claims
+          ? { ...access.claims, role: "authenticated" }
+          : { sub: "", role: "anon", aud: projectId, iss: "amazedb" };
+      await client.query(
+        `SELECT set_config('request.jwt.claim.sub', $1, true),
+          set_config('request.jwt.claim.role', $2, true),
+          set_config('request.jwt.claims', $3, true)`,
+        [claims.sub, claims.role, JSON.stringify(claims)],
       );
       const result = await work(client, access.schema, access.serviceRole);
       await client.query("COMMIT");
@@ -337,6 +379,73 @@ export class ProjectDatabase {
         `ALTER TABLE ${quoteName(schema)}.${quoteName(table)} ADD COLUMN ${quoteName(column.name)} ${column.type} ${column.nullable ? "" : "NOT NULL"}`,
       );
       return { name: column.name };
+    });
+  }
+
+  async listPolicies(ownerId: string, projectId: string, table: string) {
+    return this.withProject(ownerId, projectId, async (client, schema) => {
+      await columnsFor(client, schema, table);
+      return (
+        await client.query<RlsPolicy>(
+          `SELECT policyname, permissive,
+          ARRAY(SELECT policy_role::text FROM unnest(roles) AS policy_role) AS roles,
+          cmd, qual, with_check
+         FROM pg_catalog.pg_policies WHERE schemaname = $1 AND tablename = $2
+         ORDER BY policyname`,
+          [schema, table],
+        )
+      ).rows;
+    });
+  }
+
+  async createOwnerPolicy(
+    ownerId: string,
+    projectId: string,
+    table: string,
+    input: unknown,
+  ) {
+    const policy = policyInput.parse(input);
+    return this.withProject(ownerId, projectId, async (client, schema) => {
+      const columns = await columnsFor(client, schema, table);
+      const ownerColumn = columns.find(
+        (column) => column.name === policy.ownerColumn,
+      );
+      if (!ownerColumn || ownerColumn.type !== "uuid")
+        throw new ApiError(400, "Choose an existing UUID owner column.");
+      const ownerCheck = `${quoteName(policy.ownerColumn)} = NULLIF(current_setting('request.jwt.claim.sub', true), '')::uuid`;
+      const command = policy.command.toUpperCase();
+      await client.query(
+        `ALTER TABLE ${quoteName(schema)}.${quoteName(table)} ENABLE ROW LEVEL SECURITY`,
+      );
+      await client.query(
+        `CREATE POLICY ${quoteName(policy.name)} ON ${quoteName(schema)}.${quoteName(table)} FOR ${command}${policy.command === "insert" ? ` WITH CHECK (${ownerCheck})` : policy.command === "select" || policy.command === "delete" ? ` USING (${ownerCheck})` : ` USING (${ownerCheck}) WITH CHECK (${ownerCheck})`}`,
+      );
+      return {
+        name: policy.name,
+        command: command.toUpperCase(),
+        ownerColumn: policy.ownerColumn,
+      };
+    });
+  }
+
+  async deletePolicy(
+    ownerId: string,
+    projectId: string,
+    table: string,
+    name: string,
+  ) {
+    const validName = policyName.parse(name);
+    return this.withProject(ownerId, projectId, async (client, schema) => {
+      await columnsFor(client, schema, table);
+      const result = await client.query(
+        "SELECT 1 FROM pg_catalog.pg_policies WHERE schemaname = $1 AND tablename = $2 AND policyname = $3",
+        [schema, table, validName],
+      );
+      if (!result.rowCount) throw new ApiError(404, "RLS policy not found.");
+      await client.query(
+        `DROP POLICY ${quoteName(validName)} ON ${quoteName(schema)}.${quoteName(table)}`,
+      );
+      return { deleted: true };
     });
   }
 
@@ -469,6 +578,7 @@ export class ProjectDatabase {
         "UpdateStmt",
         "DeleteStmt",
         "CreateStmt",
+        "CreatePolicyStmt",
         "AlterTableStmt",
         "IndexStmt",
         "DropStmt",
@@ -482,7 +592,7 @@ export class ProjectDatabase {
     if (
       "DropStmt" in statement &&
       statement.DropStmt &&
-      !["OBJECT_TABLE", "OBJECT_INDEX"].includes(
+      !["OBJECT_TABLE", "OBJECT_INDEX", "OBJECT_POLICY"].includes(
         String(statement.DropStmt.removeType),
       )
     )

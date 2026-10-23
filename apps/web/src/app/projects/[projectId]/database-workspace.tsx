@@ -17,6 +17,7 @@ import {
   Plus,
   RefreshCw,
   Save,
+  ShieldCheck,
   Table2,
   Trash2,
   X,
@@ -37,6 +38,14 @@ type NewColumn = {
 };
 type Draft = { mode: "value" | "null" | "default"; value: string };
 type Row = Record<string, unknown>;
+type Policy = {
+  policyname: string;
+  permissive: string;
+  roles: string[];
+  cmd: string;
+  qual: string | null;
+  with_check: string | null;
+};
 
 function displayValue(value: unknown) {
   if (value === null) return "NULL";
@@ -118,7 +127,7 @@ export default function DatabaseWorkspace({
   const [rowsLoading, setRowsLoading] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
-  const [tab, setTab] = useState<"tables" | "sql">("tables");
+  const [tab, setTab] = useState<"tables" | "sql" | "policies">("tables");
   const [modal, setModal] = useState<
     "table" | "column" | "row" | "delete" | null
   >(null);
@@ -134,6 +143,12 @@ export default function DatabaseWorkspace({
   const [drafts, setDrafts] = useState<Record<string, Draft>>({});
   const [sql, setSql] = useState("SELECT current_user;");
   const [sqlResult, setSqlResult] = useState<SqlResult | null>(null);
+  const [policies, setPolicies] = useState<Policy[]>([]);
+  const [policyName, setPolicyName] = useState("owner_access");
+  const [policyOwnerColumn, setPolicyOwnerColumn] = useState("");
+  const [policyCommand, setPolicyCommand] = useState<
+    "all" | "select" | "insert" | "update" | "delete"
+  >("all");
 
   useEffect(() => {
     let active = true;
@@ -194,6 +209,21 @@ export default function DatabaseWorkspace({
     };
   }, [base, selected, page]);
 
+  useEffect(() => {
+    if (tab !== "policies" || !selected) return;
+    let active = true;
+    void api(`${base}/policies/${encodeURIComponent(selected)}`)
+      .then((result) => {
+        if (active) setPolicies(result.policies);
+      })
+      .catch((caught) => {
+        if (active) setError((caught as Error).message);
+      });
+    return () => {
+      active = false;
+    };
+  }, [base, selected, tab]);
+
   async function refreshTables(preferred = selected) {
     const result = await api(`${base}/tables`);
     setTables(result.tables);
@@ -217,6 +247,32 @@ export default function DatabaseWorkspace({
       return;
     }
     setData(result);
+  }
+
+  async function refreshPolicies(table = selected) {
+    if (!table) return;
+    const result = await api(`${base}/policies/${encodeURIComponent(table)}`);
+    setPolicies(result.policies);
+  }
+
+  async function createPolicy(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    await perform(async () => {
+      const uuidColumns =
+        data?.columns.filter((column) => column.type === "uuid") ?? [];
+      const ownerColumn =
+        uuidColumns.find((column) => column.name === policyOwnerColumn) ??
+        uuidColumns[0];
+      if (!ownerColumn)
+        throw new Error("This table needs a UUID owner column.");
+      await api(`${base}/policies/${encodeURIComponent(selected)}`, "POST", {
+        name: policyName,
+        ownerColumn: ownerColumn.name,
+        command: policyCommand,
+      });
+      await refreshPolicies();
+      setError("");
+    });
   }
 
   async function perform(work: () => Promise<void>) {
@@ -327,6 +383,13 @@ export default function DatabaseWorkspace({
   const hasPrimary =
     data?.columns.some((column) => column.primary_key) ?? false;
   const tableReady = Boolean(selected && data && !rowsLoading);
+  const uuidColumns =
+    data?.columns.filter((column) => column.type === "uuid") ?? [];
+  const selectedOwnerColumn = uuidColumns.some(
+    (column) => column.name === policyOwnerColumn,
+  )
+    ? policyOwnerColumn
+    : (uuidColumns[0]?.name ?? "");
 
   return (
     <div className="database-workspace">
@@ -371,6 +434,20 @@ export default function DatabaseWorkspace({
         >
           <Code2 size={16} />
           SQL editor
+        </button>
+        <button
+          role="tab"
+          aria-selected={tab === "policies"}
+          aria-controls="policies-panel"
+          id="policies-tab"
+          onClick={() => {
+            setTab("policies");
+            setError("");
+          }}
+          disabled={busy}
+        >
+          <ShieldCheck size={16} />
+          RLS policies
         </button>
         <code className="schema-label" title={project.schema_name}>
           {project.schema_name}
@@ -596,7 +673,7 @@ export default function DatabaseWorkspace({
             ) : null}
           </main>
         </div>
-      ) : (
+      ) : tab === "sql" ? (
         <main
           id="sql-panel"
           role="tabpanel"
@@ -694,6 +771,164 @@ export default function DatabaseWorkspace({
                 {sqlResult ? "Statement completed" : "No query results"}
               </div>
             )}
+          </section>
+        </main>
+      ) : (
+        <main
+          id="policies-panel"
+          role="tabpanel"
+          aria-labelledby="policies-tab"
+          className="policies-panel"
+        >
+          <div className="policies-heading">
+            <div>
+              <p className="eyebrow">ROW LEVEL SECURITY</p>
+              <h1>Policies</h1>
+            </div>
+            <label htmlFor="policy-table">
+              Table
+              <select
+                id="policy-table"
+                value={selected}
+                onChange={(event) => {
+                  setSelected(event.target.value);
+                  setPage(0);
+                  setData(null);
+                  setPolicies([]);
+                  setError("");
+                }}
+                disabled={busy || !tables.length}
+              >
+                {tables.map((table) => (
+                  <option key={table.name} value={table.name}>
+                    {table.name}
+                  </option>
+                ))}
+              </select>
+            </label>
+          </div>
+          <p className="policy-warning">
+            <ShieldCheck size={17} />
+            Policies restrict anon and authenticated REST requests. Service-role
+            requests bypass row-level policies. Until you add a policy, enabling
+            RLS denies those requests for this table.
+          </p>
+          {error && (
+            <p className="error" role="alert">
+              {error}
+            </p>
+          )}
+          <section className="policy-section">
+            <h2>
+              Existing policies <span>{policies.length}</span>
+            </h2>
+            {policies.length ? (
+              <div className="policy-list">
+                {policies.map((policy) => (
+                  <article className="policy-item" key={policy.policyname}>
+                    <div className="policy-item-heading">
+                      <strong>{policy.policyname}</strong>
+                      <span>{policy.cmd}</span>
+                      <button
+                        className="icon-button danger-icon"
+                        title={`Delete policy ${policy.policyname}`}
+                        aria-label={`Delete policy ${policy.policyname}`}
+                        disabled={busy}
+                        onClick={() =>
+                          void perform(async () => {
+                            await api(
+                              `${base}/policies/${encodeURIComponent(selected)}/${encodeURIComponent(policy.policyname)}`,
+                              "DELETE",
+                            );
+                            await refreshPolicies();
+                          })
+                        }
+                      >
+                        <Trash2 size={15} />
+                      </button>
+                    </div>
+                    <code>
+                      {policy.qual ?? policy.with_check ?? "No expression"}
+                    </code>
+                    <small>Roles: {policy.roles.join(", ")}</small>
+                  </article>
+                ))}
+              </div>
+            ) : (
+              <p className="no-policies">No policies for this table.</p>
+            )}
+          </section>
+          <section className="policy-section policy-builder">
+            <h2>Create an owner policy</h2>
+            <p>
+              Allow each authenticated user to access rows whose UUID owner
+              column matches their verified user ID.
+            </p>
+            <form onSubmit={createPolicy}>
+              <label htmlFor="policy-name">Policy name</label>
+              <input
+                id="policy-name"
+                value={policyName}
+                onChange={(event) => setPolicyName(event.target.value)}
+                required
+                pattern="[a-z_][a-z0-9_]{0,62}"
+                maxLength={63}
+              />
+              <div className="policy-form-grid">
+                <div>
+                  <label htmlFor="owner-column">UUID owner column</label>
+                  <select
+                    id="owner-column"
+                    value={selectedOwnerColumn}
+                    onChange={(event) =>
+                      setPolicyOwnerColumn(event.target.value)
+                    }
+                    disabled={!uuidColumns.length}
+                  >
+                    {uuidColumns.map((column) => (
+                      <option key={column.name} value={column.name}>
+                        {column.name}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <div>
+                  <label htmlFor="policy-command">Command</label>
+                  <select
+                    id="policy-command"
+                    value={policyCommand}
+                    onChange={(event) =>
+                      setPolicyCommand(
+                        event.target.value as typeof policyCommand,
+                      )
+                    }
+                  >
+                    <option value="all">All</option>
+                    <option value="select">Select</option>
+                    <option value="insert">Insert</option>
+                    <option value="update">Update</option>
+                    <option value="delete">Delete</option>
+                  </select>
+                </div>
+              </div>
+              {!uuidColumns.length && (
+                <p className="policy-hint">
+                  Add a UUID owner column to this table before creating an
+                  ownership policy.
+                </p>
+              )}
+              <button
+                className="primary"
+                disabled={busy || !selectedOwnerColumn || !selected}
+              >
+                {busy ? (
+                  <LoaderCircle className="spin" size={16} />
+                ) : (
+                  <Plus size={16} />
+                )}
+                Enable RLS and create policy
+              </button>
+            </form>
           </section>
         </main>
       )}

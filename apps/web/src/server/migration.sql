@@ -26,3 +26,26 @@ CREATE TABLE IF NOT EXISTS control_plane.projects (
     created_at timestamptz NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS projects_owner_idx ON control_plane.projects(owner_id);
+
+CREATE TABLE IF NOT EXISTS control_plane.application_users (
+    id uuid NOT NULL,
+    project_id uuid NOT NULL REFERENCES control_plane.projects(id) ON DELETE CASCADE,
+    email text NOT NULL,
+    password_hash text NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (project_id, id),
+    UNIQUE (project_id, email)
+);
+CREATE TABLE IF NOT EXISTS control_plane.application_refresh_tokens (
+    token_hash text PRIMARY KEY,
+    project_id uuid NOT NULL,
+    user_id uuid NOT NULL,
+    expires_at timestamptz NOT NULL,
+    revoked_at timestamptz,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    FOREIGN KEY (project_id, user_id)
+        REFERENCES control_plane.application_users(project_id, id)
+        ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS application_refresh_user_idx
+    ON control_plane.application_refresh_tokens(project_id, user_id);

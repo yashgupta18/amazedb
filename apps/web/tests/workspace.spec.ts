@@ -129,6 +129,113 @@ test("database tools support table and row editing and isolated SQL", async ({
       { headers: { apikey: keys.anon } },
     );
     expect((await apiDelete.json()).length).toBe(1);
+    await page.getByRole("button", { name: "Column", exact: true }).click();
+    await page.getByLabel("New column name").fill("owner_id");
+    await page.getByLabel("New column type").selectOption("uuid");
+    await page
+      .getByRole("dialog")
+      .getByRole("button", { name: "Add column", exact: true })
+      .click();
+    const appAuthUrl = `/api/auth/v1/${project.id}`;
+    const authSignupA = await page.request.post(`${appAuthUrl}/signup`, {
+      headers: { apikey: keys.anon },
+      data: {
+        email: `alice-${randomUUID()}@example.com`,
+        password: "application-password-a",
+      },
+    });
+    expect(authSignupA.status()).toBe(201);
+    const userA = await authSignupA.json();
+    const authSignupB = await page.request.post(`${appAuthUrl}/signup`, {
+      headers: { apikey: keys.anon },
+      data: {
+        email: `bob-${randomUUID()}@example.com`,
+        password: "application-password-b",
+      },
+    });
+    expect(authSignupB.status()).toBe(201);
+    const userB = await authSignupB.json();
+    await page.getByRole("tab", { name: "SQL editor" }).click();
+    await page
+      .getByLabel("SQL query", { exact: true })
+      .fill(`UPDATE todos SET owner_id = '${userA.user.id}'`);
+    await page.getByRole("button", { name: "Run query", exact: true }).click();
+    await expect(
+      page.getByText("Statement completed", { exact: true }),
+    ).toBeVisible();
+    await page.getByRole("tab", { name: "RLS policies" }).click();
+    await page.getByLabel("Policy name").fill("owner_rows_only");
+    await page
+      .getByRole("button", { name: "Enable RLS and create policy" })
+      .click();
+    await expect(
+      page.getByText("owner_rows_only", { exact: true }),
+    ).toBeVisible();
+    const anonymousRows = await page.request.get(
+      `${restUrl}/todos?select=id,title`,
+      { headers: { apikey: keys.anon } },
+    );
+    expect(await anonymousRows.json()).toEqual([]);
+    const aliceRows = await page.request.get(
+      `${restUrl}/todos?select=id,title`,
+      {
+        headers: {
+          apikey: keys.anon,
+          Authorization: `Bearer ${userA.access_token}`,
+        },
+      },
+    );
+    expect((await aliceRows.json()).length).toBeGreaterThan(0);
+    const bobRows = await page.request.get(`${restUrl}/todos?select=id,title`, {
+      headers: {
+        apikey: keys.anon,
+        Authorization: `Bearer ${userB.access_token}`,
+      },
+    });
+    expect(await bobRows.json()).toEqual([]);
+    const wrongOwnerInsert = await page.request.post(`${restUrl}/todos`, {
+      headers: {
+        apikey: keys.anon,
+        Authorization: `Bearer ${userA.access_token}`,
+      },
+      data: { title: "Not Alice's row", done: true, owner_id: userB.user.id },
+    });
+    expect(wrongOwnerInsert.status()).toBe(403);
+    const aliceInsert = await page.request.post(`${restUrl}/todos`, {
+      headers: {
+        apikey: keys.anon,
+        Authorization: `Bearer ${userA.access_token}`,
+      },
+      data: { title: "Alice's row", done: true, owner_id: userA.user.id },
+    });
+    expect(aliceInsert.status()).toBe(201);
+    const refresh = await page.request.post(`${appAuthUrl}/refresh`, {
+      headers: { apikey: keys.anon },
+      data: { refresh_token: userA.refresh_token },
+    });
+    expect(refresh.status()).toBe(200);
+    const refreshed = await refresh.json();
+    const replay = await page.request.post(`${appAuthUrl}/refresh`, {
+      headers: { apikey: keys.anon },
+      data: { refresh_token: userA.refresh_token },
+    });
+    expect(replay.status()).toBe(401);
+    const logout = await page.request.post(`${appAuthUrl}/logout`, {
+      headers: { apikey: keys.anon },
+      data: { refresh_token: refreshed.refresh_token },
+    });
+    expect(logout.status()).toBe(200);
+    const afterLogout = await page.request.post(`${appAuthUrl}/refresh`, {
+      headers: { apikey: keys.anon },
+      data: { refresh_token: refreshed.refresh_token },
+    });
+    expect(afterLogout.status()).toBe(401);
+    const serviceCleanup = await page.request.delete(
+      `${restUrl}/todos?title=eq.Alice%27s%20row`,
+      { headers: { apikey: keys.service } },
+    );
+    expect((await serviceCleanup.json()).length).toBe(1);
+    await page.getByRole("tab", { name: "Table editor" }).click();
     await page.getByRole("button", { name: "Edit row 1", exact: true }).click();
     await page.getByLabel("done mode", { exact: true }).selectOption("value");
     await page.locator('[id="value-done"]').selectOption("true");
@@ -136,7 +243,7 @@ test("database tools support table and row editing and isolated SQL", async ({
       .getByRole("button", { name: "Save changes", exact: true })
       .click();
     await expect(
-      page.getByRole("cell", { name: "true", exact: true }),
+      page.getByRole("cell", { name: "true", exact: true }).first(),
     ).toBeVisible();
     expect(
       await page.evaluate(

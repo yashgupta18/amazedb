@@ -4,6 +4,9 @@ import { after, test } from "node:test";
 import { Pool } from "pg";
 import { ProjectDatabase } from "./project-database";
 import { restRequest } from "./rest-api";
+import { ApplicationAuth } from "./application-auth";
+import { SignJWT } from "jose";
+import { projectSigningKey } from "./project-tokens";
 import {
   ApiError,
   ControlPlane,
@@ -16,6 +19,193 @@ if (!process.env.DATABASE_URL)
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 const platform = new ControlPlane(pool);
 const accounts: string[] = [];
+
+test("project auth rotates refresh tokens and PostgreSQL RLS isolates JWT users", async () => {
+  const session = await platform.signUp({
+    email: `rls-${randomUUID()}@example.com`,
+    password: "dashboard-test-password",
+  });
+  accounts.push(session.account.id);
+  const first = await platform.createProject(session.account.id, {
+    name: "RLS project",
+  });
+  const second = await platform.createProject(session.account.id, {
+    name: "Different audience",
+  });
+  const auth = new ApplicationAuth(pool);
+  const database = new ProjectDatabase(pool);
+  const userA = await auth.signUp(first.project.id, first.keys.anon, {
+    email: "alice@example.com",
+    password: "application-password-a",
+  });
+  const userB = await auth.signUp(first.project.id, first.keys.anon, {
+    email: "bob@example.com",
+    password: "application-password-b",
+  });
+  const otherProjectUser = await auth.signUp(
+    second.project.id,
+    second.keys.anon,
+    {
+      email: "alice@example.com",
+      password: "application-password-c",
+    },
+  );
+  await assert.rejects(
+    auth.signUp(first.project.id, first.keys.anon, {
+      email: "alice@example.com",
+      password: "application-password-a",
+    }),
+    (error: unknown) => error instanceof ApiError && error.status === 409,
+  );
+  await assert.rejects(
+    auth.signIn(first.project.id, second.keys.anon, {
+      email: "alice@example.com",
+      password: "application-password-a",
+    }),
+    (error: unknown) => error instanceof ApiError && error.status === 401,
+  );
+  const signedIn = await auth.signIn(first.project.id, first.keys.anon, {
+    email: "alice@example.com",
+    password: "application-password-a",
+  });
+  assert.notEqual(signedIn.access_token, "");
+  await assert.rejects(
+    auth.signIn(first.project.id, first.keys.anon, {
+      email: "alice@example.com",
+      password: "wrong-password",
+    }),
+    (error: unknown) => error instanceof ApiError && error.status === 401,
+  );
+
+  const refreshed = await auth.refresh(first.project.id, first.keys.anon, {
+    refresh_token: userA.refresh_token,
+  });
+  assert.notEqual(refreshed.refresh_token, userA.refresh_token);
+  await assert.rejects(
+    auth.refresh(first.project.id, first.keys.anon, {
+      refresh_token: userA.refresh_token,
+    }),
+    (error: unknown) => error instanceof ApiError && error.status === 401,
+  );
+  await assert.rejects(
+    auth.refresh(first.project.id, second.keys.anon, {
+      refresh_token: refreshed.refresh_token,
+    }),
+    (error: unknown) => error instanceof ApiError && error.status === 401,
+  );
+  await database.createTable(session.account.id, first.project.id, {
+    name: "documents",
+    columns: [
+      { name: "owner_id", type: "uuid", nullable: false },
+      { name: "body", type: "text", nullable: false },
+    ],
+  });
+  await database.createOwnerPolicy(
+    session.account.id,
+    first.project.id,
+    "documents",
+    {
+      name: "owner_reads_and_writes",
+      ownerColumn: "owner_id",
+      command: "all",
+    },
+  );
+  assert.equal(
+    (
+      await database.listPolicies(
+        session.account.id,
+        first.project.id,
+        "documents",
+      )
+    ).length,
+    1,
+  );
+
+  const url = `http://localhost/api/rest/v1/${first.project.id}/documents`;
+  async function rest(
+    key: string,
+    method = "GET",
+    token?: string,
+    query = "",
+    body?: unknown,
+  ) {
+    const response = await restRequest(
+      new Request(`${url}${query}`, {
+        method,
+        headers: {
+          apikey: key,
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+          ...(body === undefined ? {} : { "Content-Type": "application/json" }),
+        },
+        body: body === undefined ? undefined : JSON.stringify(body),
+      }),
+      first.project.id,
+      "documents",
+    );
+    return response as { rows: Record<string, unknown>[] };
+  }
+
+  await rest(first.keys.anon, "POST", userA.access_token, "", {
+    owner_id: userA.user.id,
+    body: "Alice document",
+  });
+  await rest(first.keys.anon, "POST", userB.access_token, "", {
+    owner_id: userB.user.id,
+    body: "Bob document",
+  });
+  assert.equal((await rest(first.keys.anon)).rows.length, 0);
+  assert.deepEqual(
+    (await rest(first.keys.anon, "GET", userA.access_token)).rows.map(
+      (row) => row.body,
+    ),
+    ["Alice document"],
+  );
+  assert.deepEqual(
+    (await rest(first.keys.anon, "GET", userB.access_token)).rows.map(
+      (row) => row.body,
+    ),
+    ["Bob document"],
+  );
+  assert.equal((await rest(first.keys.service)).rows.length, 2);
+  await assert.rejects(
+    rest(first.keys.anon, "GET", otherProjectUser.access_token),
+    (error: unknown) => error instanceof ApiError && error.status === 401,
+  );
+  const expiredToken = await new SignJWT({ role: "authenticated" })
+    .setProtectedHeader({ alg: "HS256", typ: "JWT" })
+    .setIssuer("amazedb")
+    .setAudience(first.project.id)
+    .setSubject(userA.user.id)
+    .setIssuedAt(Math.floor(Date.now() / 1000) - 120)
+    .setExpirationTime(Math.floor(Date.now() / 1000) - 60)
+    .sign(
+      projectSigningKey(
+        first.project.id,
+        await (async () =>
+          (
+            await pool.query<{ service_key_hash: string }>(
+              "SELECT service_key_hash FROM control_plane.projects WHERE id = $1",
+              [first.project.id],
+            )
+          ).rows[0].service_key_hash)(),
+      ),
+    );
+  await assert.rejects(
+    rest(first.keys.anon, "GET", expiredToken),
+    (error: unknown) => error instanceof ApiError && error.status === 401,
+  );
+  await auth.signOut(first.project.id, first.keys.anon, {
+    refresh_token: refreshed.refresh_token,
+  });
+  await assert.rejects(
+    auth.refresh(first.project.id, first.keys.anon, {
+      refresh_token: refreshed.refresh_token,
+    }),
+    (error: unknown) => error instanceof ApiError && error.status === 401,
+  );
+  await platform.deleteProject(session.account.id, first.project.id);
+  await platform.deleteProject(session.account.id, second.project.id);
+});
 
 test("project API keys expose filtered REST CRUD with separate anon and service roles", async () => {
   const session = await platform.signUp({
